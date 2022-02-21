@@ -1,98 +1,12 @@
-import time
-import mcubes
-import trimesh
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from encoding import get_encoder
-
-import raymarching
-
-def sample_pdf(bins, weights, n_samples, det=False):
-    # This implementation is from NeRF
-    # bins: [B, T], old_z_vals
-    # weights: [B, T - 1], bin weights.
-    # return: [B, n_samples], new_z_vals
-
-    # Get pdf
-    weights = weights + 1e-5  # prevent nans
-    pdf = weights / torch.sum(weights, -1, keepdim=True)
-    cdf = torch.cumsum(pdf, -1)
-    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)
-    # Take uniform samples
-    if det:
-        u = torch.linspace(0. + 0.5 / n_samples, 1. - 0.5 / n_samples, steps=n_samples).to(weights.device)
-        u = u.expand(list(cdf.shape[:-1]) + [n_samples])
-    else:
-        u = torch.rand(list(cdf.shape[:-1]) + [n_samples]).to(weights.device)
-
-    # Invert CDF
-    u = u.contiguous()
-    inds = torch.searchsorted(cdf, u, right=True)
-    below = torch.max(torch.zeros_like(inds - 1), inds - 1)
-    above = torch.min((cdf.shape[-1] - 1) * torch.ones_like(inds), inds)
-    inds_g = torch.stack([below, above], -1)  # (B, n_samples, 2)
-
-    matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
-    cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
-    bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
-
-    denom = (cdf_g[..., 1] - cdf_g[..., 0])
-    denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
-    t = (u - cdf_g[..., 0]) / denom
-    samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
-
-    return samples
+from .renderer import NeRFRenderer
 
 
-def near_far_from_bound(rays_o, rays_d, bound, type='cube'):
-    # rays: [B, N, 3], [B, N, 3]
-    # bound: int, radius for ball or half-edge-length for cube
-    # return near [B, N, 1], far [B, N, 1]
-
-    radius = rays_o.norm(dim=-1, keepdim=True)
-
-    if type == 'sphere':
-        near = radius - bound # [B, N, 1]
-        far = radius + bound
-
-    elif type == 'cube':
-        tmin = (-bound - rays_o) / rays_d # [B, N, 3]
-        tmax = (bound - rays_o) / rays_d
-        near = torch.where(tmin < tmax, tmin, tmax).max(dim=-1, keepdim=True)[0]
-        far = torch.where(tmin > tmax, tmin, tmax).min(dim=-1, keepdim=True)[0]
-        near = torch.clamp(near, min=0.05)
-
-    return near, far
-
-
-def plot_pointcloud(pc, color=None):
-    # pc: [N, 3]
-    # color: [N, 3/4]
-    pc = trimesh.PointCloud(pc, color)
-    # axis
-    axes = trimesh.creation.axis(axis_length=4)
-    # sphere
-    #sphere = trimesh.creation.icosphere(radius=1)
-    trimesh.Scene([pc, axes]).show()
-
-
-def map_color(value, cmap_name='viridis', vmin=None, vmax=None):
-    # value: [N], float
-    # return: RGB, [N, 3], float in [0, 1]
-    import matplotlib.cm as cm
-    if vmin is None: vmin = value.min()
-    if vmax is None: vmax = value.max()
-    value = (value - vmin) / (vmax - vmin) # range in [0, 1]
-    cmap = cm.get_cmap(cmap_name) 
-    rgb = cmap(value)[:, :3]  # will return rgba, we take only first 3 so we get rgb
-    return rgb 
-
-
-# NeRF-SH
-class NeRFNetwork(nn.Module):
+class NeRFNetwork(NeRFRenderer):
     def __init__(self,
                  encoding="hashgrid",
                  encoding_dir="sphere_harmonics",
@@ -101,9 +15,9 @@ class NeRFNetwork(nn.Module):
                  geo_feat_dim=15,
                  num_layers_color=3,
                  hidden_dim_color=64,
-                 density_grid_size=-1, # density grid size
+                 cuda_ray=False,
                  ):
-        super().__init__()
+        super().__init__(cuda_ray)
 
         # sigma network
         self.num_layers = num_layers
@@ -149,15 +63,6 @@ class NeRFNetwork(nn.Module):
 
         self.color_net = nn.ModuleList(color_net)
 
-        # density grid
-        if density_grid_size > 0:
-            # buffer is like parameter but never requires_grad
-            density_grid = torch.zeros([density_grid_size + 1] * 3) # +1 because we save values at grid
-            self.register_buffer('density_grid', density_grid)
-            self.mean_density = 0
-            self.iter_density = 0
-        else:
-            self.density_grid = None
     
     def forward(self, x, d, bound):
         # x: [B, N, 3], in [-bound, bound]

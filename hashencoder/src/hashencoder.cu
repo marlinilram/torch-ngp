@@ -1,5 +1,3 @@
-#include <stdint.h>
-
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -11,6 +9,7 @@
 #include <algorithm>
 #include <stdexcept>
 
+#include <stdint.h>
 #include <cstdio>
 
 
@@ -40,7 +39,7 @@ __device__ uint32_t fast_hash(const uint32_t pos_grid[D]) {
 	// While 1 is technically not a good prime for hashing (or a prime at all), it helps memory coherence
 	// and is sufficient for our use case of obtaining a uniformly colliding index from high-dimensional
 	// coordinates.
-	constexpr uint32_t primes[7] = { 1, 19349663, 83492791, 25165843, 6291469, 12582917, 3145739 };
+    constexpr uint32_t primes[7] = { 1, 2654435761, 805459861, 3674653429, 2097192037, 1434869437, 2165219737 };
 
 	uint32_t result = 0;
 	#pragma unroll
@@ -59,15 +58,12 @@ __device__ uint32_t get_grid_index(const uint32_t ch, const uint32_t hashmap_siz
 
 	#pragma unroll
     for (uint32_t d = 0; d < D && stride <= hashmap_size; d++) {
-        //printf("get_grid_index d=%d, pos_grid[d]=%d, stride=%d, reso=%d\n", d, pos_grid[d], stride, resolution);
         index += pos_grid[d] * stride;
         stride *= (resolution + 1);
     }
 
     if (stride > hashmap_size) {
-        //printf("hash because %d > %d\n", stride, hashmap_size);
         index = fast_hash<D>(pos_grid);
-        //printf("hashed (%d, %d) = %d to %d in %d\n", pos_grid[0], pos_grid[1], pos_grid[0] + resolution * pos_grid[1], index % hashmap_size, hashmap_size);
     }
 
 	return (index % hashmap_size) * C + ch;
@@ -95,6 +91,33 @@ __global__ void kernel_grid(
     inputs += b * D;
     outputs += level * B * C + b * C;
 
+    // check input range (should be in [0, 1])
+    bool flag_oob = false;
+    #pragma unroll
+    for (uint32_t d = 0; d < D; d++) {
+        if (inputs[d] < 0 || inputs[d] > 1) {
+            flag_oob = true;
+        }
+    }
+    // if input out of bound, just set output to 0
+    if (flag_oob) {
+        #pragma unroll
+        for (uint32_t ch = 0; ch < C; ch++) {
+            outputs[ch] = 0; 
+        }
+        if (calc_grad_inputs) {
+            dy_dx += b * D * L * C + level * D * C; // B L D C
+            #pragma unroll
+            for (uint32_t d = 0; d < D; d++) {
+                #pragma unroll
+                for (uint32_t ch = 0; ch < C; ch++) {
+                    dy_dx[d * C + ch] = 0; 
+                }       
+            }
+        }
+        return;
+    }
+
     const uint32_t hashmap_size = offsets[level + 1] - offsets[level];
     const float scale = exp2f(level * S) * H - 1.0f;
     const uint32_t resolution = (uint32_t)ceil(scale) + 1;
@@ -113,7 +136,7 @@ __global__ void kernel_grid(
     //printf("[b=%d, l=%d] pos=(%f, %f)+(%d, %d)\n", b, level, pos[0], pos[1], pos_grid[0], pos_grid[1]);
 
     // interpolate
-    float results[C] = {0}; // temp results in register
+    scalar_t results[C] = {0}; // temp results in register
 
     #pragma unroll
     for (uint32_t idx = 0; idx < (1 << D); idx++) {
@@ -157,7 +180,7 @@ __global__ void kernel_grid(
         #pragma unroll
         for (uint32_t gd = 0; gd < D; gd++) {
 
-            float results_grad[C] = {0}; // temp
+            scalar_t results_grad[C] = {0};
 
             #pragma unroll
             for (uint32_t idx = 0; idx < (1 << (D - 1)); idx++) {
@@ -215,7 +238,7 @@ __global__ void kernel_grid_backward(
     // locate
     grad_grid += offsets[level] * C;
     inputs += b * D;
-    grad += b * L * C + level * C + ch;
+    grad += level * B * C + b * C + ch; // L, B, C
 
     const uint32_t hashmap_size = offsets[level + 1] - offsets[level];
     const float scale = exp2f(level * S) * H - 1.0f;
@@ -230,6 +253,12 @@ __global__ void kernel_grid_backward(
         pos[d] = (float)inputs[d] * scale + 0.5f;
         pos_grid[d] = floorf(pos[d]);
         pos[d] -= (float)pos_grid[d];
+    }
+
+    scalar_t grad_cur[N_C] = {0}; // fetch to register
+    #pragma unroll
+    for (uint32_t c = 0; c < N_C; c++) {
+        grad_cur[c] = grad[c];
     }
 
     // interpolate
@@ -257,14 +286,14 @@ __global__ void kernel_grid_backward(
             #pragma unroll
             for (uint32_t c = 0; c < N_C; c += 2) {
                 // process two __half at once (by interpreting as a __half2)
-                __half2 v = {(__half)(grad[c] * w), (__half)(grad[c + 1] * w)};
+                __half2 v = {(__half)(w * grad_cur[c]), (__half)(w * grad_cur[c + 1])};
                 atomicAdd((__half2*)&grad_grid[index + c], v);
             }
-        // float, or __half when N_C % 2 != 0
+        // float, or __half when N_C % 2 != 0 (which means C == 1)
         } else {
             #pragma unroll
             for (uint32_t c = 0; c < N_C; c++) {
-                atomicAdd(&grad_grid[index + c], w * grad[c]);
+                atomicAdd(&grad_grid[index + c], w * grad_cur[c]);
             }
         }
     }    
@@ -284,16 +313,19 @@ __global__ void kernel_input_backward(
     const uint32_t b = t / D;
     const uint32_t d = t - b * D;
 
-    grad += b * L * C;
     dy_dx += b * L * D * C;
+
+    scalar_t result = 0;
     
     # pragma unroll
     for (int l = 0; l < L; l++) {
         # pragma unroll
         for (int ch = 0; ch < C; ch++) {
-            grad_inputs[t] += grad[l * C + ch] * dy_dx[l * D * C + d * C + ch];
+            result += grad[l * B * C + b * C + ch] * dy_dx[l * D * C + d * C + ch];
         }
     }
+
+    grad_inputs[t] = result;
 }
 
 
@@ -315,6 +347,7 @@ void kernel_grid_wrapper(const scalar_t *inputs, const scalar_t *embeddings, con
 // offsets: [L + 1], uint32_t
 // outputs: [L, B, C], float (L first, so only one level of hashmap needs to fit into cache at a time.)
 // H: base resolution
+// dy_dx: [B, L * D * C]
 template <typename scalar_t>
 void hash_encode_forward_cuda(const scalar_t *inputs, const scalar_t *embeddings, const int *offsets, scalar_t *outputs, const uint32_t B, const uint32_t D, const uint32_t C, const uint32_t L, const float S, const uint32_t H, const bool calc_grad_inputs, scalar_t *dy_dx) {
     switch (D) {
@@ -352,7 +385,7 @@ void kernel_grid_backward_wrapper(const scalar_t *grad, const scalar_t *inputs, 
 }
 
 
-// grad: [B, L * C], float
+// grad: [L, B, C], float
 // inputs: [B, D], float, in [0, 1]
 // embeddings: [sO, C], float
 // offsets: [L + 1], uint32_t
@@ -389,7 +422,7 @@ void hash_encode_forward(const at::Tensor inputs, const at::Tensor embeddings, c
     CHECK_IS_FLOATING(dy_dx);
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-    inputs.type(), "hash_encode_forward", ([&] {
+    inputs.scalar_type(), "hash_encode_forward", ([&] {
         hash_encode_forward_cuda<scalar_t>(inputs.data_ptr<scalar_t>(), embeddings.data_ptr<scalar_t>(), offsets.data_ptr<int>(), outputs.data_ptr<scalar_t>(), B, D, C, L, S, H, calc_grad_inputs, dy_dx.data_ptr<scalar_t>());
     }));
 }
@@ -420,7 +453,7 @@ void hash_encode_backward(const at::Tensor grad, const at::Tensor inputs, const 
     CHECK_IS_FLOATING(grad_inputs);
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-    grad.type(), "hash_encode_backward", ([&] {
+    grad.scalar_type(), "hash_encode_backward", ([&] {
         hash_encode_backward_cuda<scalar_t>(grad.data_ptr<scalar_t>(), inputs.data_ptr<scalar_t>(), embeddings.data_ptr<scalar_t>(), offsets.data_ptr<int>(), grad_embeddings.data_ptr<scalar_t>(), B, D, C, L, S, H, calc_grad_inputs, dy_dx.data_ptr<scalar_t>(), grad_inputs.data_ptr<scalar_t>());
     }));
     

@@ -47,7 +47,6 @@ def lift(x, y, z, intrinsics):
 
     device = x.device
     
-    intrinsics = intrinsics.to(device)
     fx = intrinsics[..., 0, 0].unsqueeze(-1)
     fy = intrinsics[..., 1, 1].unsqueeze(-1)
     cx = intrinsics[..., 0, 2].unsqueeze(-1)
@@ -58,7 +57,7 @@ def lift(x, y, z, intrinsics):
     y_lift = (y - cy) / fy * z
 
     # homogeneous
-    return torch.stack((x_lift, y_lift, z, torch.ones_like(z).to(device)), dim=-1)
+    return torch.stack((x_lift, y_lift, z, torch.ones_like(z)), dim=-1)
 
 
 def get_rays(c2w, intrinsics, H, W, N_rays=-1):
@@ -71,22 +70,22 @@ def get_rays(c2w, intrinsics, H, W, N_rays=-1):
     rays_o = c2w[..., :3, 3] # [B, 3]
     prefix = c2w.shape[:-2]
 
-    i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H), indexing='ij') # for torch < 1.10, should remove indexing='ij'
-    i = i.t().to(device).reshape([*[1]*len(prefix), H*W]).expand([*prefix, H*W])
-    j = j.t().to(device).reshape([*[1]*len(prefix), H*W]).expand([*prefix, H*W])
+    i, j = torch.meshgrid(torch.linspace(0, W-1, W, device=device), torch.linspace(0, H-1, H, device=device), indexing='ij') # for torch < 1.10, should remove indexing='ij'
+    i = i.t().reshape([*[1]*len(prefix), H*W]).expand([*prefix, H*W])
+    j = j.t().reshape([*[1]*len(prefix), H*W]).expand([*prefix, H*W])
 
     if N_rays > 0:
         N_rays = min(N_rays, H*W)
-        select_hs = torch.randint(0, H, size=[N_rays]).to(device)
-        select_ws = torch.randint(0, W, size=[N_rays]).to(device)
+        select_hs = torch.randint(0, H, size=[N_rays], device=device)
+        select_ws = torch.randint(0, W, size=[N_rays], device=device)
         select_inds = select_hs * W + select_ws
         select_inds = select_inds.expand([*prefix, N_rays])
         i = torch.gather(i, -1, select_inds)
         j = torch.gather(j, -1, select_inds)
     else:
-        select_inds = torch.arange(H*W).to(device).expand([*prefix, H*W])
+        select_inds = torch.arange(H*W, device=device).expand([*prefix, H*W])
 
-    pixel_points_cam = lift(i, j, torch.ones_like(i).to(device), intrinsics=intrinsics)
+    pixel_points_cam = lift(i, j, torch.ones_like(i), intrinsics=intrinsics)
     pixel_points_cam = pixel_points_cam.transpose(-1, -2)
 
     world_coords = torch.bmm(c2w, pixel_points_cam).transpose(-1, -2)[..., :3]
@@ -303,7 +302,7 @@ class Trainer(object):
             gt_rgb = images
 
         outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, **self.conf)
-            
+    
         pred_rgb = outputs['rgb']
 
         loss = self.criterion(pred_rgb, gt_rgb)
@@ -347,12 +346,12 @@ class Trainer(object):
     def test_step(self, data):  
         poses = data["pose"] # [B, 4, 4]
         intrinsics = data["intrinsic"] # [B, 3, 3]
-        H, W = data['shape'][0].item(), data['shape'][1].item()
+        H, W = int(data['H'][0]), int(data['W'][0]) # get the target size...
 
         B = poses.shape[0]
         rays_o, rays_d, _ = get_rays(poses, intrinsics, H, W, -1)
         outputs = self.model.render(rays_o, rays_d, staged=True, **self.conf)
-        pred_rgb = outputs['rgb'].reshape(B, H, W, 3)
+        pred_rgb = outputs['rgb'].reshape(B, H, W, -1)
         pred_depth = outputs['depth'].reshape(B, H, W)
 
         return pred_rgb, pred_depth
@@ -422,11 +421,6 @@ class Trainer(object):
         
         self.log(f"==> Start Test, save results to {save_path}")
 
-        # update grid
-        if self.model.density_grid is not None:
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                self.model.update_density_grid(self.conf['bound'])
-
         pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
         self.model.eval()
         with torch.no_grad():
@@ -480,9 +474,9 @@ class Trainer(object):
         self.model.train()
 
         # update grid
-        if self.model.density_grid is not None:
+        if self.model.cuda_ray:
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                self.model.update_density_grid(self.conf['bound'])
+                self.model.update_extra_state(self.conf['bound'])
 
         # distributedSampler: must call set_epoch() to shuffle indices across multiple epochs
         # ref: https://pytorch.org/docs/stable/data.html
@@ -514,8 +508,6 @@ class Trainer(object):
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
-        
-            #print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
             
             if self.ema is not None:
                 self.ema.update()
@@ -658,6 +650,10 @@ class Trainer(object):
             'stats': self.stats,
         }
 
+        if self.model.cuda_ray:
+            state['mean_count'] = self.model.mean_count
+            state['mean_density'] = self.model.mean_density
+
         if full:
             state['optimizer'] = self.optimizer.state_dict()
             state['lr_scheduler'] = self.lr_scheduler.state_dict()
@@ -729,6 +725,10 @@ class Trainer(object):
 
         self.stats = checkpoint_dict['stats']
         self.epoch = checkpoint_dict['epoch']
+
+        if self.model.cuda_ray:
+            self.model.mean_count = checkpoint_dict['mean_count']
+            self.model.mean_density = checkpoint_dict['mean_density']
         
         if self.optimizer and  'optimizer' in checkpoint_dict:
             try:

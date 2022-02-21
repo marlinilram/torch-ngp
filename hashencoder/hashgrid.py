@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.autograd import Function
+from torch.autograd.function import once_differentiable
 from torch.cuda.amp import custom_bwd, custom_fwd 
 
 # from .backend import _backend
@@ -11,7 +12,6 @@ from . import _hash_encoder as _backend
 class _hash_encode(Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.half)
-    #@custom_fwd
     def forward(ctx, inputs, embeddings, offsets, per_level_scale, base_resolution, calc_grad_inputs=False):
         # inputs: [B, D], float in [0, 1]
         # embeddings: [sO, C], float
@@ -20,7 +20,7 @@ class _hash_encode(Function):
 
         inputs = inputs.contiguous()
         embeddings = embeddings.contiguous()
-        offsets = offsets.contiguous().to(inputs.device)
+        offsets = offsets.contiguous()
 
         B, D = inputs.shape # batch size, coord dim
         L = offsets.shape[0] - 1 # level
@@ -29,12 +29,12 @@ class _hash_encode(Function):
         H = base_resolution # base resolution
 
         # L first, optimize cache for cuda kernel, but needs an extra permute later
-        outputs = torch.zeros(L, B, C, device=inputs.device, dtype=inputs.dtype)
+        outputs = torch.empty(L, B, C, device=inputs.device, dtype=inputs.dtype)
 
         if calc_grad_inputs:
-            dy_dx = torch.zeros(B, L * D * C, device=inputs.device, dtype=inputs.dtype)
+            dy_dx = torch.empty(B, L * D * C, device=inputs.device, dtype=inputs.dtype)
         else:
-            dy_dx = torch.zeros(1, device=inputs.device, dtype=inputs.dtype)
+            dy_dx = torch.empty(1, device=inputs.device, dtype=inputs.dtype)
 
         _backend.hash_encode_forward(inputs, embeddings, offsets, outputs, B, D, C, L, S, H, calc_grad_inputs, dy_dx)
 
@@ -48,15 +48,16 @@ class _hash_encode(Function):
         return outputs
     
     @staticmethod
+    @once_differentiable
     @custom_bwd
     def backward(ctx, grad):
-        # grad: [B, L * C]
-
-        grad = grad.contiguous()
 
         inputs, embeddings, offsets, dy_dx = ctx.saved_tensors
         B, D, C, L, S, H = ctx.dims
         calc_grad_inputs = ctx.calc_grad_inputs
+
+        # grad: [B, L * C] --> [L, B, C]
+        grad = grad.view(B, L, C).permute(1, 0, 2).contiguous()
 
         grad_embeddings = torch.zeros_like(embeddings)
 
@@ -96,22 +97,23 @@ class HashEncoder(nn.Module):
             print('[WARN] detected HashGrid level_dim % 2 != 0, which will cause very slow backward is also enabled fp16! (maybe fix later)')
 
         # allocate parameters
-        self.offsets = []
+        offsets = []
         offset = 0
         self.max_params = 2 ** log2_hashmap_size
         for i in range(num_levels):
             resolution = int(np.ceil(base_resolution * per_level_scale ** i))
             params_in_level = min(self.max_params, (resolution + 1) ** input_dim) # limit max number
             params_in_level = int(params_in_level / 8) * 8 # make divisible
-            self.offsets.append(offset)
+            offsets.append(offset)
             offset += params_in_level
-        self.offsets.append(offset)
-        self.offsets = torch.from_numpy(np.array(self.offsets, dtype=np.int32))
+        offsets.append(offset)
+        offsets = torch.from_numpy(np.array(offsets, dtype=np.int32))
+        self.register_buffer('offsets', offsets)
         
-        self.n_params = self.offsets[-1] * level_dim
+        self.n_params = offsets[-1] * level_dim
 
         # parameters
-        self.embeddings = nn.Parameter(torch.zeros(offset, level_dim))
+        self.embeddings = nn.Parameter(torch.empty(offset, level_dim))
 
         self.reset_parameters()
     
@@ -120,14 +122,11 @@ class HashEncoder(nn.Module):
         self.embeddings.data.uniform_(-std, std)
 
     def __repr__(self):
-        return f"HashEncoder: input_dim={self.input_dim} num_levels={self.num_levels} level_dim={self.level_dim} H={self.base_resolution} params={self.embeddings.shape}"
+        return f"HashEncoder: input_dim={self.input_dim} num_levels={self.num_levels} level_dim={self.level_dim} base_resolution={self.base_resolution} per_level_scale={self.per_level_scale} params={tuple(self.embeddings.shape)}"
     
     def forward(self, inputs, size=1):
         # inputs: [..., input_dim], normalized real world positions in [-size, size]
         # return: [..., num_levels * level_dim]
-
-        if inputs.min().item() < -size or inputs.max().item() > size:
-            raise ValueError(f'HashGrid encoder: inputs range [{inputs.min().item()}, {inputs.max().item()}] not in [{-size}, {size}]!')
 
         inputs = (inputs + size) / (2 * size) # map to [0, 1]
         
