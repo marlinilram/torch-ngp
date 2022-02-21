@@ -26,6 +26,11 @@ import mcubes
 from rich.console import Console
 from torch_ema import ExponentialMovingAverage
 
+
+img2mse = lambda x, y : torch.mean((x - y) ** 2)
+mse2psnr = lambda x : -10. * torch.log(x) / 2.3026
+
+
 def seed_everything(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -133,6 +138,7 @@ class Trainer(object):
                  name, # name of this experiment
                  conf, # extra conf
                  model, # network 
+                 pose_refine=None,
                  criterion=None, # loss function, if None, assume inline implementation in train_step
                  optimizer=None, # optimizer
                  ema_decay=None, # if use EMA, set the decay
@@ -178,6 +184,10 @@ class Trainer(object):
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
         self.model = model
+
+        if isinstance(pose_refine, nn.Module):
+            pose_refine.to(self.device)
+        self.pose_refine = pose_refine
 
         if isinstance(criterion, nn.Module):
             criterion.to(self.device)
@@ -271,6 +281,19 @@ class Trainer(object):
         rays_o, rays_d, inds = get_rays(poses, intrinsics, H, W, self.conf['num_rays'])
         images = torch.gather(images.reshape(B, -1, C), 1, torch.stack(C*[inds], -1)) # [B, N, 3/4]
 
+        if self.conf['pose_refine']:
+            poses_refine = self.pose_refine.get_SE3(data['index'])
+            rots, trans = poses_refine[:, :3, :3], poses_refine[:, :3, 3]
+            rays_o = torch.bmm(rots, rays_o.transpose(-1, -2)).transpose(-1, -2) + trans
+            rays_d = torch.bmm(rots, rays_d.transpose(-1, -2)).transpose(-1, -2)
+
+        if self.conf['depth_loss']:
+            depths = data["depth"]
+            masks = data["mask"]
+            depths = torch.gather(depths.reshape(B, -1, 1), 1, torch.stack(1*[inds], -1)) # [B, N, 3/4]
+            masks = torch.gather(masks.reshape(B, -1, 1), 1, torch.stack(1*[inds], -1)) # [B, N, 3/4]
+            ray_depths = depths / torch.matmul(rays_d, poses[:, :3, 2:3])
+
         # train with random background color if using alpha mixing
         #bg_color = torch.ones(3, device=images.device) # [3], fixed white background
         bg_color = torch.rand(3, device=images.device) # [3], frame-wise random.
@@ -284,8 +307,16 @@ class Trainer(object):
         pred_rgb = outputs['rgb']
 
         loss = self.criterion(pred_rgb, gt_rgb)
+        psnr = mse2psnr(img2mse(pred_rgb, gt_rgb))
 
-        return pred_rgb, gt_rgb, loss
+        if self.conf['depth_loss']:
+            # compute depth loss
+            pred_depth = outputs['abs_depth']
+            pred_depth = pred_depth[..., None][masks]
+            gt_depth = ray_depths[masks]
+            loss += self.criterion(pred_depth, gt_depth) / self.conf['bound']
+
+        return pred_rgb, gt_rgb, loss, psnr
 
     def eval_step(self, data):
         images = data["image"] # [B, H, W, 3/4]
@@ -309,8 +340,9 @@ class Trainer(object):
         pred_depth = outputs['depth'].reshape(B, H, W)
 
         loss = self.criterion(pred_rgb, gt_rgb)
+        psnr = mse2psnr(img2mse(pred_rgb, gt_rgb))
 
-        return pred_rgb, pred_depth, gt_rgb, loss
+        return pred_rgb, pred_depth, gt_rgb, loss, psnr
 
     def test_step(self, data):  
         poses = data["pose"] # [B, 4, 4]
@@ -474,7 +506,7 @@ class Trainer(object):
             with torch.cuda.amp.autocast(enabled=self.fp16):
 
                 #with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,torch.profiler.ProfilerActivity.CUDA,]) as p:
-                preds, truths, loss = self.train_step(data)
+                preds, truths, loss, psnr = self.train_step(data)
                 #print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
             #with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,torch.profiler.ProfilerActivity.CUDA,]) as p:
@@ -500,11 +532,12 @@ class Trainer(object):
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss.item(), self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
+                    self.writer.add_scalar("train/psnr", psnr, self.global_step)
 
                 if self.scheduler_update_every_step:
-                    pbar.set_description(f"loss={loss.item():.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
+                    pbar.set_description(f"loss={loss.item():.4f} ({total_loss/self.local_step:.4f}), psnr={psnr:.2f}, lr={self.optimizer.param_groups[0]['lr']:.6f}")
                 else:
-                    pbar.set_description(f"loss={loss.item():.4f} ({total_loss/self.local_step:.4f})")
+                    pbar.set_description(f"loss={loss.item():.4f} ({total_loss/self.local_step:.4f}), psnr={psnr:.2f}")
                 pbar.update(loader.batch_size)
 
         average_loss = total_loss / self.local_step
@@ -552,7 +585,7 @@ class Trainer(object):
                     self.ema.copy_to()
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth, truths, loss = self.eval_step(data)
+                    preds, preds_depth, truths, loss, psnr = self.eval_step(data)
 
                 if self.ema is not None:
                     self.ema.restore()
@@ -582,6 +615,9 @@ class Trainer(object):
                     for metric in self.metrics:
                         metric.update(preds, truths)
 
+                    if self.use_tensorboardX:
+                        self.writer.add_scalar("eval/psnr", psnr, self.global_step)
+
                     # save image
                     save_path = os.path.join(self.workspace, 'validation', f'{self.name}_{self.epoch:04d}_{self.local_step:04d}.png')
                     save_path_depth = os.path.join(self.workspace, 'validation', f'{self.name}_{self.epoch:04d}_{self.local_step:04d}_depth.png')
@@ -593,7 +629,7 @@ class Trainer(object):
                     cv2.imwrite(save_path_depth, (preds_depth[0].detach().cpu().numpy() * 255).astype(np.uint8))
                     cv2.imwrite(save_path_gt, cv2.cvtColor((truths[0].detach().cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
 
-                    pbar.set_description(f"loss={loss.item():.4f} ({total_loss/self.local_step:.4f})")
+                    pbar.set_description(f"loss={loss.item():.4f} ({total_loss/self.local_step:.4f}), psnr={psnr:.2f}")
                     pbar.update(loader.batch_size)
 
         average_loss = total_loss / self.local_step

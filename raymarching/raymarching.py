@@ -6,7 +6,8 @@ import torch.nn as nn
 from torch.autograd import Function
 from torch.cuda.amp import custom_bwd, custom_fwd 
 
-from .backend import _backend
+# from .backend import _backend
+from . import _raymarching as _backend
 
 ### generate points (forward only)
 # inputs: 

@@ -7,6 +7,7 @@ from nerf.utils import *
 from nerf.opt import get_opt
 
 import argparse
+from os.path import join as pjoin
 
 #torch.autograd.set_detect_anomaly(True)
 
@@ -29,7 +30,7 @@ if __name__ == '__main__':
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1)
     valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1)
-    
+
     model = Network(
         encoding="hashgrid", encoding_dir="sphere_harmonics", 
         num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=3, hidden_dim_color=64, 
@@ -48,21 +49,8 @@ if __name__ == '__main__':
 
     print(model)
 
-    criterion = torch.nn.SmoothL1Loss()
-
-    optimizer = lambda model: torch.optim.Adam(pose_params+[
-        {'name': 'encoding', 'params': list(model.encoder.parameters())},
-        {'name': 'net', 'params': list(model.sigma_net.parameters()) + list(model.color_net.parameters()), 'weight_decay': 1e-6},
-    ], lr=1e-2, betas=(0.9, 0.99), eps=1e-15)
-
-    scheduler = lambda optimizer: optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 100, 150], gamma=0.33)
-
-    trainer = Trainer('ngp', vars(opt), model, pose_refine=pose_refine, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, use_checkpoint='latest', eval_interval=10)
-    
-    trainer.train(train_loader, valid_loader, 200)
+    trainer = Trainer('ngp', vars(opt), model, pose_refine=pose_refine, workspace=opt.workspace, fp16=opt.fp16, use_checkpoint='latest')
 
     # test dataset
-    trainer.save_mesh()
-    test_dataset = NeRFDataset(opt.path, 'test', radius=opt.radius, n_test=10)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1)
-    trainer.test(test_loader)
+    trainer.save_mesh(bound=opt.bound)
+    trainer.test(valid_loader, save_path=pjoin(opt.workspace, 'test'))
