@@ -114,6 +114,7 @@ class NeRFRenderer(nn.Module):
 
         # sample steps
         near, far = near_far_from_bound(rays_o, rays_d, bound, type='cube')
+        valid_ray_mask = near < far
 
         #print(f'near = {near.min().item()} ~ {near.max().item()}, far = {far.min().item()} ~ {far.max().item()}')
 
@@ -190,8 +191,9 @@ class NeRFRenderer(nn.Module):
         weights_sum = weights.sum(dim=-1) # [B, N]
         
         # calculate depth 
-        ori_z_vals = ((z_vals - near) / (far - near)).clamp(0, 1)
-        depth = torch.sum(weights * ori_z_vals, dim=-1)
+        rel_z_vals = ((z_vals - near) / (far - near)).clamp(0, 1)
+        rel_depth = torch.sum(weights * rel_z_vals, dim=-1)
+        depth = torch.sum(weights * z_vals, dim=-1)
 
         # calculate color
         image = torch.sum(weights.unsqueeze(-1) * rgbs, dim=-2) # [B, N, 3], in [0, 1]
@@ -201,7 +203,7 @@ class NeRFRenderer(nn.Module):
             bg_color = 1
         image = image + (1 - weights_sum).unsqueeze(-1) * bg_color
 
-        return depth, image
+        return rel_depth, image, (valid_ray_mask, depth)
 
 
     def run_cuda(self, rays_o, rays_d, num_steps, bound, upsample_steps, bg_color):
@@ -353,20 +355,27 @@ class NeRFRenderer(nn.Module):
         if staged and not self.cuda_ray:
             depth = torch.empty((B, N), device=device)
             image = torch.empty((B, N, 3), device=device)
+            abs_depth = torch.zeros((B, N), device=device)
+            mask = torch.ones((B, N, 1), device=device)
+            mask = mask > 0
 
             for b in range(B):
                 head = 0
                 while head < N:
                     tail = min(head + max_ray_batch, N)
-                    depth_, image_ = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], num_steps, bound, upsample_steps, bg_color)
+                    depth_, image_, (mask_, abs_depth_) = _run(rays_o[b:b+1, head:tail], rays_d[b:b+1, head:tail], num_steps, bound, upsample_steps, bg_color)
                     depth[b:b+1, head:tail] = depth_
                     image[b:b+1, head:tail] = image_
+                    mask[b:b+1, head:tail] = mask_
+                    abs_depth[b:b+1, head:tail] = abs_depth_
                     head += max_ray_batch
         else:
-            depth, image = _run(rays_o, rays_d, num_steps, bound, upsample_steps, bg_color)
+            depth, image, (mask, abs_depth) = _run(rays_o, rays_d, num_steps, bound, upsample_steps, bg_color)
 
         results = {}
         results['depth'] = depth
         results['rgb'] = image
+        results['mask'] = mask
+        results['abs_depth'] = abs_depth
             
         return results
