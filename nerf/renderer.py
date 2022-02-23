@@ -212,6 +212,8 @@ class NeRFRenderer(nn.Module):
 
         B, N = rays_o.shape[:2]
         device = rays_o.device
+        valid_ray_mask = torch.ones((B, N, 1), device=device)
+        valid_ray_mask = valid_ray_mask > 0
 
         if bg_color is None:
             bg_color = torch.ones(3, dtype=rays_o.dtype, device=device)
@@ -222,13 +224,13 @@ class NeRFRenderer(nn.Module):
             counter.zero_() # set to 0
             self.local_step += 1
 
-            xyzs, dirs, deltas, rays = raymarching.march_rays_train(rays_o, rays_d, bound, self.density_grid, self.mean_density, self.iter_density, counter, self.mean_count, self.training, 128, False)
+            xyzs, dirs, deltas, z_vals, rays = raymarching.march_rays_train(rays_o, rays_d, bound, self.density_grid, self.mean_density, self.iter_density, counter, self.mean_count, self.training, 128, False)
             sigmas, rgbs = self(xyzs, dirs, bound=bound)
-            depth, image = raymarching.composite_rays_train(sigmas, rgbs, deltas, rays, bound, bg_color)
+            depth, image = raymarching.composite_rays_train(sigmas, rgbs, deltas, z_vals, rays, bound, bg_color)
 
         else:
 
-            # xyzs, dirs, deltas, rays = raymarching.march_rays_train(rays_o, rays_d, bound, self.density_grid, self.mean_density, self.iter_density, None, self.mean_count, self.training, 128, True)
+            # xyzs, dirs, deltas, z_vals rays = raymarching.march_rays_train(rays_o, rays_d, bound, self.density_grid, self.mean_density, self.iter_density, None, self.mean_count, self.training, 128, True)
             # sigmas, rgbs = self(xyzs, dirs, bound=bound)
             # depth, image = raymarching.composite_rays_train(sigmas, rgbs, deltas, rays, bound, bg_color)
 
@@ -289,7 +291,7 @@ class NeRFRenderer(nn.Module):
         depth = depth.reshape(B, N)
         image = image.reshape(B, N, 3)
 
-        return depth, image
+        return depth, image, (valid_ray_mask, depth)
 
     
     def update_extra_state(self, bound, decay=0.95):

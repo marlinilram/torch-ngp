@@ -305,7 +305,8 @@ class Trainer(object):
     
         pred_rgb = outputs['rgb']
 
-        loss = self.criterion(pred_rgb, gt_rgb)
+        loss = {}
+        loss['img'] = self.criterion(pred_rgb, gt_rgb)
         psnr = mse2psnr(img2mse(pred_rgb, gt_rgb))
 
         if self.conf['depth_loss']:
@@ -313,7 +314,7 @@ class Trainer(object):
             pred_depth = outputs['abs_depth']
             pred_depth = pred_depth[..., None][masks]
             gt_depth = ray_depths[masks]
-            loss += self.criterion(pred_depth, gt_depth) / self.conf['bound']
+            loss['depth'] = self.criterion(pred_depth, gt_depth) / self.conf['bound']
 
         return pred_rgb, gt_rgb, loss, psnr
 
@@ -421,6 +422,7 @@ class Trainer(object):
         
         self.log(f"==> Start Test, save results to {save_path}")
 
+        rgbs = []
         pbar = tqdm.tqdm(total=len(loader) * loader.batch_size, bar_format='{percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
         self.model.eval()
         with torch.no_grad():
@@ -436,12 +438,17 @@ class Trainer(object):
 
                 self.log(f"[INFO] saving test image to {path}")
 
-                cv2.imwrite(path, cv2.cvtColor((preds[0].detach().cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
+                rgb = (preds[0].detach().cpu().numpy() * 255).astype(np.uint8)
+                rgbs.append(rgb)
+                cv2.imwrite(path, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
                 cv2.imwrite(path_depth, (preds_depth[0].detach().cpu().numpy() * 255).astype(np.uint8))
 
                 pbar.update(loader.batch_size)
 
         self.log(f"==> Finished Test.")
+        import imageio
+        imageio.mimwrite(os.path.join(save_path, 'rgb.mp4'), rgbs, fps=30, quality=8)
+        self.log(f"==> Finished mp4.")
 
     def prepare_data(self, data):
         if isinstance(data, list):
@@ -500,11 +507,15 @@ class Trainer(object):
             with torch.cuda.amp.autocast(enabled=self.fp16):
 
                 #with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,torch.profiler.ProfilerActivity.CUDA,]) as p:
-                preds, truths, loss, psnr = self.train_step(data)
+                preds, truths, loss_dct, psnr = self.train_step(data)
                 #print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
 
             #with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,torch.profiler.ProfilerActivity.CUDA,]) as p:
-         
+
+            loss = loss_dct['img']
+            for loss_key in loss_dct:
+                if loss_key != 'img':
+                    loss += loss_dct[loss_key]
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -523,6 +534,8 @@ class Trainer(object):
                         
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss.item(), self.global_step)
+                    for loss_key in loss_dct:
+                        self.writer.add_scalar(f"train/{loss_key}", loss_dct[loss_key].item(), self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
                     self.writer.add_scalar("train/psnr", psnr, self.global_step)
 

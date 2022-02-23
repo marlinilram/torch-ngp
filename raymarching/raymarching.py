@@ -6,8 +6,8 @@ import torch.nn as nn
 from torch.autograd import Function
 from torch.cuda.amp import custom_bwd, custom_fwd 
 
-# from .backend import _backend
-from . import _raymarching as _backend
+from .backend import _backend
+# from . import _raymarching as _backend
 
 #########################################
 ### training functions
@@ -42,12 +42,13 @@ class _march_rays_train(Function):
         xyzs = torch.zeros(M, 3, dtype=rays_o.dtype, device=rays_o.device)
         dirs = torch.zeros(M, 3, dtype=rays_o.dtype, device=rays_o.device)
         deltas = torch.zeros(M, dtype=rays_o.dtype, device=rays_o.device)
+        z_vals = torch.zeros(M, dtype=rays_o.dtype, device=rays_o.device)
         rays = torch.empty(N, 3, dtype=torch.int32, device=rays_o.device) # id, offset, num_steps
 
         if step_counter is None:
             step_counter = torch.zeros(2, dtype=torch.int32, device=rays_o.device) # point counter, ray counter
 
-        _backend.march_rays_train(rays_o, rays_d, density_grid, mean_density, iter_density, bound, N, H, M, xyzs, dirs, deltas, rays, step_counter, perturb) # m is the actually used points number
+        _backend.march_rays_train(rays_o, rays_d, density_grid, mean_density, iter_density, bound, N, H, M, xyzs, dirs, deltas, z_vals, rays, step_counter, perturb) # m is the actually used points number
 
         #print(step_counter, M)
 
@@ -59,8 +60,9 @@ class _march_rays_train(Function):
             xyzs = xyzs[:m]
             dirs = dirs[:m]
             deltas = deltas[:m]
+            z_vals = z_vals[:m]
 
-        return xyzs, dirs, deltas, rays
+        return xyzs, dirs, deltas, z_vals, rays
 
 march_rays_train = _march_rays_train.apply
 
@@ -71,11 +73,12 @@ march_rays_train = _march_rays_train.apply
 class _composite_rays_train(Function):
     @staticmethod
     @custom_fwd(cast_inputs=torch.half)
-    def forward(ctx, sigmas, rgbs, deltas, rays, bound, bg_color):
+    def forward(ctx, sigmas, rgbs, deltas, z_vals, rays, bound, bg_color):
         
         sigmas = sigmas.contiguous()
         rgbs = rgbs.contiguous()
         deltas = deltas.contiguous()
+        z_vals = z_vals.contiguous()
         rays = rays.contiguous()
 
         M = sigmas.shape[0]
@@ -84,9 +87,10 @@ class _composite_rays_train(Function):
         depth = torch.empty(N, dtype=sigmas.dtype, device=sigmas.device)
         image = torch.empty(N, 3, dtype=sigmas.dtype, device=sigmas.device)
 
-        _backend.composite_rays_train_forward(sigmas, rgbs, deltas, rays, bound, bg_color, M, N, depth, image)
+        _backend.composite_rays_train_forward(sigmas, rgbs, deltas, z_vals, rays, bound, bg_color, M, N, depth, image)
 
-        ctx.save_for_backward(sigmas, rgbs, deltas, rays, image, bg_color)
+        # ctx.save_for_backward(sigmas, rgbs, deltas, rays, image, bg_color)
+        ctx.save_for_backward(sigmas, rgbs, deltas, z_vals, rays, image, depth, bg_color)
         ctx.dims = [M, N, bound]
 
         return depth, image
@@ -94,19 +98,23 @@ class _composite_rays_train(Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_depth, grad_image):
+        # import pdb; pdb.set_trace()
         # grad_depth, grad_image: [N, 3]
 
         grad_image = grad_image.contiguous()
+        grad_depth = grad_depth.contiguous()
 
-        sigmas, rgbs, deltas, rays, image, bg_color = ctx.saved_tensors
+        sigmas, rgbs, deltas, z_vals, rays, image, depth, bg_color = ctx.saved_tensors
+        # sigmas, rgbs, depth, deltas, rays, image, bg_color = ctx.saved_tensors
         M, N, bound = ctx.dims
-        
+
         grad_sigmas = torch.zeros_like(sigmas)
         grad_rgbs = torch.zeros_like(rgbs)
 
-        _backend.composite_rays_train_backward(grad_image, sigmas, rgbs, deltas, rays, image, bound, M, N, grad_sigmas, grad_rgbs)
+        # _backend.composite_rays_train_backward(grad_image, sigmas, rgbs, deltas, rays, image, bound, M, N, grad_sigmas, grad_rgbs)
+        _backend.composite_rays_train_w_depth_backward(grad_image, grad_depth, sigmas, rgbs, deltas, z_vals, rays, depth, image, bound, M, N, grad_sigmas, grad_rgbs)
 
-        return grad_sigmas, grad_rgbs, None, None, None, None
+        return grad_sigmas, grad_rgbs, None, None, None, None, None
 
 
 composite_rays_train = _composite_rays_train.apply

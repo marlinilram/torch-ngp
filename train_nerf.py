@@ -24,12 +24,12 @@ if __name__ == '__main__':
 
     seed_everything(opt.seed)
 
-    train_dataset = NeRFDataset(opt.path, 'train', radius=opt.radius)
+    train_dataset = NeRFDataset(opt.path, 'train', downscale=1, radius=opt.radius)
     valid_dataset = NeRFDataset(opt.path, 'valid', downscale=1, radius=opt.radius)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1)
     valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1)
-    
+
     model = NeRFNetwork(
         encoding="hashgrid", encoding_dir="sphere_harmonics", 
         num_layers=2, hidden_dim=64, geo_feat_dim=15, num_layers_color=3, hidden_dim_color=64, 
