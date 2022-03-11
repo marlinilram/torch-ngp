@@ -31,6 +31,22 @@ img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10. * torch.log(x) / 2.3026
 
 
+def srgb_to_linear(srgb):
+    linear = torch.zeros_like(srgb)
+    cvt_mask = srgb <= 0.04045
+    linear[cvt_mask] = srgb[cvt_mask] / 12.92
+    linear[~cvt_mask] = ((srgb[~cvt_mask] + 0.055) / 1.055).pow(2.4)
+    return linear
+
+
+def linear_to_srgb(linear):
+    srgb = torch.zeros_like(linear)
+    cvt_mask = linear < 0.0031308
+    srgb[cvt_mask] = linear[cvt_mask] * 12.92
+    srgb[~cvt_mask] = 1.055 * linear[~cvt_mask].pow(0.41666) - 0.055
+    return srgb
+
+
 def seed_everything(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -138,6 +154,7 @@ class Trainer(object):
                  conf, # extra conf
                  model, # network 
                  pose_refine=None,
+                 exposure_refine=None,
                  criterion=None, # loss function, if None, assume inline implementation in train_step
                  optimizer=None, # optimizer
                  ema_decay=None, # if use EMA, set the decay
@@ -187,6 +204,10 @@ class Trainer(object):
         if isinstance(pose_refine, nn.Module):
             pose_refine.to(self.device)
         self.pose_refine = pose_refine
+
+        if isinstance(exposure_refine, nn.Module):
+            exposure_refine.to(self.device)
+        self.exposure_refine = exposure_refine
 
         if isinstance(criterion, nn.Module):
             criterion.to(self.device)
@@ -271,43 +292,63 @@ class Trainer(object):
     ### ------------------------------	
 
     def train_step(self, data):
-        images = data["image"] # [B, H, W, 3/4]
-        poses = data["pose"] # [B, 4, 4]
-        intrinsics = data["intrinsic"] # [B, 3, 3]
+        # ray batch from dataset
+        if 'ray_rgb' in data:
+            ray_rgb = data['ray_rgb'][None, ...]  # expand to [1, N, C], N = num_ray and B = 1
+            rays_o = ray_rgb[:, :, :3]
+            rays_d = ray_rgb[:, :, 3:6]
+            images = ray_rgb[:, :, 6:]
+            C = images.shape[2]
 
-        # sample rays 
-        B, H, W, C = images.shape
-        rays_o, rays_d, inds = get_rays(poses, intrinsics, H, W, self.conf['num_rays'])
-        images = torch.gather(images.reshape(B, -1, C), 1, torch.stack(C*[inds], -1)) # [B, N, 3/4]
+            if self.conf['depth_loss']:
+                ray_depths = data['ray_depth'][None, ...]
+                masks = data['ray_mask'][None, ...]
 
-        if self.conf['pose_refine']:
-            poses_refine = self.pose_refine.get_SE3(data['index'])
-            rots, trans = poses_refine[:, :3, :3], poses_refine[:, :3, 3]
-            rays_o = torch.bmm(rots, rays_o.transpose(-1, -2)).transpose(-1, -2) + trans
-            rays_d = torch.bmm(rots, rays_d.transpose(-1, -2)).transpose(-1, -2)
+        else:
+            images = data["image"]  # [B, H, W, 3/4]
+            poses = data["pose"]  # [B, 4, 4]
+            intrinsics = data["intrinsic"]  # [B, 3, 3]
 
-        if self.conf['depth_loss']:
-            depths = data["depth"]
-            masks = data["mask"]
-            depths = torch.gather(depths.reshape(B, -1, 1), 1, torch.stack(1*[inds], -1)) # [B, N, 3/4]
-            masks = torch.gather(masks.reshape(B, -1, 1), 1, torch.stack(1*[inds], -1)) # [B, N, 3/4]
-            ray_depths = depths / torch.matmul(rays_d, poses[:, :3, 2:3])
+            # sample rays
+            B, H, W, C = images.shape
+            rays_o, rays_d, inds = get_rays(poses, intrinsics, H, W, self.conf['num_rays'])
+            images = torch.gather(images.reshape(B, -1, C), 1, torch.stack(C*[inds], -1)) # [B, N, 3/4]
+
+            if self.conf['pose_refine']:
+                poses_refine = self.pose_refine.get_SE3(data['index'])
+                rots, trans = poses_refine[:, :3, :3], poses_refine[:, :3, 3]
+                rays_o = torch.bmm(rots, rays_o.transpose(-1, -2)).transpose(-1, -2) + trans
+                rays_d = torch.bmm(rots, rays_d.transpose(-1, -2)).transpose(-1, -2)
+
+            if self.conf['depth_loss']:
+                depths = data["depth"]
+                masks = data["mask"]
+                depths = torch.gather(depths.reshape(B, -1, 1), 1, torch.stack(1*[inds], -1)) # [B, N, 3/4]
+                masks = torch.gather(masks.reshape(B, -1, 1), 1, torch.stack(1*[inds], -1)) # [B, N, 3/4]
+                ray_depths = depths / torch.matmul(rays_d, poses[:, :3, 2:3])
 
         # train with random background color if using alpha mixing
         #bg_color = torch.ones(3, device=images.device) # [3], fixed white background
-        bg_color = torch.rand(3, device=images.device) # [3], frame-wise random.
+        bg_color = torch.rand(3, device=images.device)  # [3], frame-wise random.
         if C == 4:
             gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
         else:
             gt_rgb = images
 
         outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, **self.conf)
-    
+
         pred_rgb = outputs['rgb']
+        if self.conf['exposure_refine']:
+            ray_idx = data['ray_idx'][None, ...]
+            expo_scales = self.exposure_refine.get_exposure_scale(ray_idx)
+            final_pred_rgb = pred_rgb / expo_scales
+            gt_rgb = srgb_to_linear(gt_rgb)
+        else:
+            final_pred_rgb = pred_rgb
 
         loss = {}
-        loss['img'] = self.criterion(pred_rgb, gt_rgb)
-        psnr = mse2psnr(img2mse(pred_rgb, gt_rgb))
+        loss['img'] = self.criterion(final_pred_rgb, gt_rgb)
+        psnr = mse2psnr(img2mse(final_pred_rgb, gt_rgb))
 
         if self.conf['depth_loss']:
             # compute depth loss
@@ -316,7 +357,7 @@ class Trainer(object):
             gt_depth = ray_depths[masks]
             loss['depth'] = self.criterion(pred_depth, gt_depth) / self.conf['bound']
 
-        return pred_rgb, gt_rgb, loss, psnr
+        return final_pred_rgb, gt_rgb, loss, psnr
 
     def eval_step(self, data):
         images = data["image"] # [B, H, W, 3/4]
@@ -339,6 +380,9 @@ class Trainer(object):
         pred_rgb = outputs['rgb'].reshape(B, H, W, -1)
         pred_depth = outputs['depth'].reshape(B, H, W)
 
+        if self.conf['exposure_refine'] or self.conf['color_linear']:
+            pred_rgb = linear_to_srgb(pred_rgb)
+
         loss = self.criterion(pred_rgb, gt_rgb)
         psnr = mse2psnr(img2mse(pred_rgb, gt_rgb))
 
@@ -354,6 +398,8 @@ class Trainer(object):
         outputs = self.model.render(rays_o, rays_d, staged=True, **self.conf)
         pred_rgb = outputs['rgb'].reshape(B, H, W, -1)
         pred_depth = outputs['depth'].reshape(B, H, W)
+        if self.conf['exposure_refine'] or self.conf['color_linear']:
+            pred_rgb = linear_to_srgb(pred_rgb)
 
         return pred_rgb, pred_depth
 
@@ -447,7 +493,7 @@ class Trainer(object):
 
         self.log(f"==> Finished Test.")
         import imageio
-        imageio.mimwrite(os.path.join(save_path, 'rgb.mp4'), rgbs, fps=30, quality=8)
+        imageio.mimwrite(os.path.join(save_path, 'rgb.mp4'), rgbs, fps=min(30, len(loader.dataset)), quality=8)
         self.log(f"==> Finished mp4.")
 
     def prepare_data(self, data):
@@ -480,10 +526,13 @@ class Trainer(object):
 
         self.model.train()
 
-        # update grid
-        if self.model.cuda_ray:
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                self.model.update_extra_state(self.conf['bound'])
+        # update grid, train in bundle ray时，每次完成一张图片ray数量时进行一次更新
+        freq_update_extra_state = len(loader.dataset)
+        if self.conf['train_bundle_ray']:
+            freq_update_extra_state = loader.dataset.rays_per_img // loader.batch_size
+        # if self.model.cuda_ray and not self.conf['train_bundle_ray']:
+        #     with torch.cuda.amp.autocast(enabled=self.fp16):
+        #         self.model.update_extra_state(self.conf['bound'])
 
         # distributedSampler: must call set_epoch() to shuffle indices across multiple epochs
         # ref: https://pytorch.org/docs/stable/data.html
@@ -496,7 +545,11 @@ class Trainer(object):
         self.local_step = 0
 
         for data in loader:
-            
+
+            if self.model.cuda_ray and self.global_step%freq_update_extra_state == 0:
+                with torch.cuda.amp.autocast(enabled=self.fp16):
+                    self.model.update_extra_state(self.conf['bound'])
+
             self.local_step += 1
             self.global_step += 1
             
@@ -519,7 +572,7 @@ class Trainer(object):
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            
+
             if self.ema is not None:
                 self.ema.update()
 

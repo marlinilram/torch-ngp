@@ -25,7 +25,7 @@ if __name__ == '__main__':
 
     seed_everything(opt.seed)
 
-    valid_dataset = NeRFDataset(opt.path, 'ar', downscale=1, radius=opt.radius)
+    valid_dataset = NeRFDataset(opt.path, 'ar', downscale=0.5, radius=opt.radius)
 
     valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=1)
 
@@ -52,5 +52,5 @@ if __name__ == '__main__':
     trainer = Trainer('ngp', vars(opt), model, pose_refine=pose_refine, workspace=opt.workspace, fp16=opt.fp16, use_checkpoint='latest')
 
     # test dataset
-    trainer.save_mesh(bound=opt.bound)
+    # trainer.save_mesh(bound=opt.bound, threshold=model.mean_density if model.cuda_ray else 10)
     trainer.test(valid_loader, save_path=pjoin(opt.workspace, 'test'))

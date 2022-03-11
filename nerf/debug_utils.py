@@ -32,3 +32,18 @@ def vis_camera(pose, H, W, focal, img_name, output_id):
         # Trescope().selectOutput(output_id).plotVector3D(*up).withConfig(Vector3DConfig().locations(*loc).color(0xff00ff00))
         # Trescope().selectOutput(output_id).plotVector3D(*forward).withConfig(Vector3DConfig().locations(*loc).color(0xff0000ff))
 
+
+def depth_to_pts(img, depth, H, W, intrinsic, pose, is_ray_depth):
+    import torch
+    from .utils import get_rays
+    rays_o, rays_d, _ = get_rays(torch.tensor(pose[None, ...]), torch.tensor(intrinsic[None, ...]), H, W, -1)
+    rays_o = rays_o.reshape(1, H, W, -1).numpy().squeeze()
+    rays_d = rays_d.reshape(1, H, W, -1).numpy().squeeze()
+    if is_ray_depth:
+        ray_depth = depth[..., None]
+    else:
+        ray_depth = depth[..., None] / np.matmul(rays_d, pose[:3, 2:3])
+    # pts = rays_o + ray_depth * rays_d
+    # pts = np.reshape(pts, (-1, 3))
+    # colors = np.reshape(255*img, (-1, 3)).astype(np.uint8)
+    return np.concatenate([rays_o + ray_depth * rays_d, img], axis=2)

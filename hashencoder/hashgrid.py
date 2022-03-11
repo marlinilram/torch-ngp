@@ -6,8 +6,8 @@ from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.cuda.amp import custom_bwd, custom_fwd 
 
-# from .backend import _backend
-from . import _hash_encoder as _backend
+from .backend import _backend
+# from . import _hash_encoder as _backend
 
 class _hash_encode(Function):
     @staticmethod
@@ -103,7 +103,7 @@ class HashEncoder(nn.Module):
         for i in range(num_levels):
             resolution = int(np.ceil(base_resolution * per_level_scale ** i))
             params_in_level = min(self.max_params, (resolution + 1) ** input_dim) # limit max number
-            params_in_level = int(params_in_level / 8) * 8 # make divisible
+            # params_in_level = int(params_in_level / 8) * 8 # make divisible
             offsets.append(offset)
             offset += params_in_level
         offsets.append(offset)
@@ -122,7 +122,7 @@ class HashEncoder(nn.Module):
         self.embeddings.data.uniform_(-std, std)
 
     def __repr__(self):
-        return f"HashEncoder: input_dim={self.input_dim} num_levels={self.num_levels} level_dim={self.level_dim} base_resolution={self.base_resolution} per_level_scale={self.per_level_scale} params={tuple(self.embeddings.shape)}"
+        return f"HashEncoder: input_dim={self.input_dim} num_levels={self.num_levels} level_dim={self.level_dim} base_resolution={self.base_resolution} log2_hashmap_size={self.log2_hashmap_size} per_level_scale={self.per_level_scale} params={tuple(self.embeddings.shape)}"
     
     def forward(self, inputs, size=1):
         # inputs: [..., input_dim], normalized real world positions in [-size, size]

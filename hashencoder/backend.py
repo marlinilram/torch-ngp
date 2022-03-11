@@ -13,6 +13,7 @@ _backend = load(name='_hash_encoder',
                     'hashencoder.cu',
                     'bindings.cpp',
                 ]],
+                verbose=True
                 )
 
 __all__ = ['_backend']

@@ -1,0 +1,116 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: 当前文件",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Python: nerf.vis_scene",
+            "type": "python",
+            "request": "launch",
+            "module": "nerf.vis_scene",
+            "args": [
+                "data/arkit_huiyishi_4/transforms_aligned.json",
+                "--workspace",
+                "trial_nerf23_wo_pose_w_depth",
+                // "--pose_refine"
+            ],
+        },
+        {
+            "name": "Python: nerf.est_global_scale",
+            "type": "python",
+            "request": "launch",
+            "module": "nerf.est_global_scale",
+            "args": [
+                // "data/arkit_huiyishi_2/transforms.json",
+                // "--workspace",
+                // "trial_nerf23_wo_pose_w_depth",
+                // "--pose_refine"
+            ],
+        },
+        {
+            "name": "Python: nerf.arkit2nerf",
+            "type": "python",
+            "request": "launch",
+            "module": "nerf.arkit2nerf",
+            "args": [
+                "--images",
+                "data/arkit_huiyishi_4/images",
+                "--text",
+                "data/arkit_huiyishi_4",
+                "--out",
+                "data/arkit_huiyishi_4/transforms_arkit.json"
+                // "--pose_refine"
+            ],
+        },
+        {
+            "name": "Python: nerf.colmap2nerf",
+            "type": "python",
+            "request": "launch",
+            "program": "nerf/colmap2nerf.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--images",
+                "data/arkit_huiyishi_4/images",
+                "--text",
+                "data/arkit_huiyishi_4",
+                "--out",
+                "data/arkit_huiyishi_4/transforms.json"
+                // "--pose_refine"
+            ],
+        },
+        {
+            "name": "Python: test_nerf",
+            "type": "python",
+            "request": "launch",
+            "program": "test_nerf2.py",
+            "console": "integratedTerminal",
+            "args": [
+                "data/arkit_huiyishi/transforms.json",
+                "--workspace",
+                "trial_nerf/trial_nerf35_wo_pose_w_depth_factor_1_batch_8192_cuda_ray_bundle_ray_epoch_1_huber_fusion_depth_expo",
+                "--cuda_ray",
+                "--fp16",
+                "--bound",
+                "2.25",
+                "--depth_loss",
+                "--num_rays",
+                "8192",
+                "--train_bundle_ray",
+                // "--pose_refine"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Python: train_nerf",
+            "type": "python",
+            "request": "launch",
+            "program": "train_nerf.py",
+            "console": "integratedTerminal",
+            "args": [
+                "data/arkit_huiyishi_2/transforms_arkit.json",
+                "--workspace",
+                "trial_nerf/trial_nerf_debug",
+                "--cuda_ray",
+                "--fp16",
+                "--bound",
+                "2.25",
+                "--depth_loss",
+                "--num_rays",
+                "256",
+                "--train_bundle_ray",
+                "--exposure_refine",
+                "--color_linear",
+                // "--pose_refine"
+            ],
+            "justMyCode": false
+        }
+    ]
+}
