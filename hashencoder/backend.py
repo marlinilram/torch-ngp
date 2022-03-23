@@ -3,7 +3,7 @@ from torch.utils.cpp_extension import load
 
 _src_path = os.path.dirname(os.path.abspath(__file__))
 
-_backend = load(name='_hash_encoder',
+_backend = load(name='_hash_encoder_muyu',
                 extra_cflags=['-O3', '-std=c++14'],
                 extra_cuda_cflags=[
                     '-O3', '-std=c++14',

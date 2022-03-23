@@ -6,8 +6,8 @@ from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.cuda.amp import custom_bwd, custom_fwd 
 
-# from .backend import _backend
-from . import _sh_encoder as _backend
+from .backend import _backend
+# from . import _sh_encoder as _backend
 
 class _sh_encoder(Function):
     @staticmethod
@@ -70,6 +70,9 @@ class SHEncoder(nn.Module):
     def __repr__(self):
         return f"SHEncoder: input_dim={self.input_dim} degree={self.degree}"
     
+    def forward_tmp(self, inputs, size=1):
+        pass
+
     def forward(self, inputs, size=1):
         # inputs: [..., input_dim], normalized real world positions in [-size, size]
         # return: [..., degree^2]
